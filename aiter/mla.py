@@ -226,7 +226,10 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and q.dtype != torch.bfloat16:
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
+            # For FP8 kv_split=1, the C++ kernel redirects ptr_R to the
+            # output buffer (o) instead of splitData (logits).  Return o
+            # so callers that use the return value get the actual result.
+            return o.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
