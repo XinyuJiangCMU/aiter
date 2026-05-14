@@ -837,19 +837,62 @@ def get_2stage_cfgs(
         "doweight_stage1",
     ]
 
+    def _collect_fmoe_tune_files(main_tune_file):
+        """Return [main_tune_file, then any aiter/configs/model_configs/*tuned_fmoe*.csv].
+
+        Model-specific tune CSVs shipped under ``model_configs/`` (e.g. for
+        DeepSeek-V4, Kimi-K2, GLM-5) were previously only read at prebuild time
+        by ``moe_recipes.get_moe_ck2stages_prebuild_variants``. Runtime dispatch
+        ignored them, so any row HAI tuned for a specific model never reached
+        ``_lookup_cfg`` unless the user manually merged it into the main CSV
+        (or set ``AITER_CONFIG_FMOE`` to point at the model-specific file).
+        This helper makes runtime read both, keeping the main file's rows as
+        the authoritative override when keys collide.
+        """
+        import glob
+
+        files = []
+        if main_tune_file and os.path.exists(main_tune_file):
+            files.append(main_tune_file)
+        model_configs_dir = os.path.join(
+            os.path.dirname(main_tune_file), "model_configs"
+        )
+        if os.path.isdir(model_configs_dir):
+            for extra in sorted(
+                glob.glob(os.path.join(model_configs_dir, "*tuned_fmoe*.csv"))
+            ):
+                if extra not in files:
+                    files.append(extra)
+        return files
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
-        df = pd.read_csv(tune_file)
+        if isinstance(tune_file, (str, os.PathLike)):
+            tune_files = [tune_file]
+        else:
+            tune_files = list(tune_file)
+
+        frames = []
+        for f in tune_files:
+            if not os.path.exists(f):
+                continue
+            frames.append(pd.read_csv(f))
+        if not frames:
+            return {}, {}
+
+        df = pd.concat(frames, ignore_index=True)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
+
+        sources_repr = tune_files if len(tune_files) > 1 else tune_files[0]
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
         dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
         if dup_mask.any():
             logger.warning(
-                f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
+                f"[fused_moe] duplicate tuned rows (primary) in {sources_repr}; "
                 f"keeping first match for {int(dup_mask.sum())} rows"
             )
             df_primary = df_primary.loc[~dup_mask]
@@ -862,7 +905,7 @@ def get_2stage_cfgs(
         dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
         if dup_mask.any():
             logger.warning(
-                f"[fused_moe] duplicate tuned rows after disabling act_type in {tune_file}; "
+                f"[fused_moe] duplicate tuned rows after disabling act_type in {sources_repr}; "
                 f"keeping first match for {int(dup_mask.sum())} rows"
             )
             df_fallback = df_fallback.loc[~dup_mask]
@@ -905,10 +948,11 @@ def get_2stage_cfgs(
     global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    tune_files = _collect_fmoe_tune_files(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
-        cfg_2stages = get_cfg_2stages(tune_file)
+        cfg_2stages = get_cfg_2stages(tune_files)
     cu_num = get_cu_num()
     keys = (
         cu_num,
@@ -986,7 +1030,7 @@ def get_2stage_cfgs(
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-        cfg_2stages = get_cfg_2stages(tune_file)
+        cfg_2stages = get_cfg_2stages(tune_files)
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
