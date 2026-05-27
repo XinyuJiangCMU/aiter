@@ -326,7 +326,18 @@ def fused_moe_(
         if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+            if q_dtype_w == dtypes.fp4x2:
+                # bf16xfp4 small-batch kernel not yet implemented in flydsl
+                # path; bf16 fallback dispatches cktile_moe_stage1 which has
+                # no Run() overload for per_1x32 + fp4x2 ("Unsupported
+                # scales/output dtype" at runtime). Force fp8 activation for
+                # fp4 weights regardless of batch size until a small-batch
+                # bf16xfp4 kernel lands. dsv4_fp8fp4_tuned_fmoe.csv entries
+                # (added in #2951) all use q_dtype_a=fp8_e4m3fn so the
+                # flydsl_moe1_afp8_wfp4_* kernels are the intended dispatch
+                # target for fp4 experts.
+                q_dtype_a = dtypes.fp8
+            elif get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
